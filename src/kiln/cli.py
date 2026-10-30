@@ -119,7 +119,7 @@ def cmd_task_create(a) -> int:
         print(f"  kiln task create --session {a.session} --instruction-file <file>")
         return 2
     try:
-        d = tasks.create(p, a.session, instruction, task_id=a.id)
+        d = tasks.create(p, a.session, instruction, task_id=a.id, family=a.family or "")
     except tasks.TaskError as e:
         print(f"cannot create task: {e}", file=sys.stderr)
         return 1
@@ -256,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--session", required=True)
     t.add_argument("--instruction-file")
     t.add_argument("--id")
+    t.add_argument("--family", help="bug family, used to keep related tasks in one split")
     t.set_defaults(fn=cmd_task_create)
     t = ts.add_parser("validate", help="run the controls and the attack suite")
     t.add_argument("task", help="task id, id@version, or a task directory")

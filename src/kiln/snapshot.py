@@ -34,6 +34,8 @@ LOCKFILES = (
     "setup.py", "setup.cfg", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
     "Cargo.lock", "go.sum",
 )  # fmt: skip
+CACHE_DIRS = ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".hypothesis", ".tox", ".nox")
+CACHE_FILES = ("*.pyc", "*.pyo", ".coverage", ".coverage.*", ".DS_Store")
 LFS_POINTER = b"version https://git-lfs.github.com/spec/v1"
 
 
@@ -57,6 +59,11 @@ def _entry(path: Path) -> dict | None:
 def _is_secret(rel: str) -> bool:
     name = rel.rsplit("/", 1)[-1]
     return any(fnmatch.fnmatch(name, p) for p in SECRET_PATTERNS)
+
+
+def _is_cache(rel: str) -> bool:
+    parts = rel.split("/")
+    return any(p in CACHE_DIRS for p in parts[:-1]) or any(fnmatch.fnmatch(parts[-1], g) for g in CACHE_FILES)
 
 
 def _z(raw: bytes) -> list[str]:
@@ -105,7 +112,9 @@ def capture(project: Project, label: str) -> str:
 
     tracked = _z(gitutil.run(repo, "ls-files", "-z", "--cached").stdout)
     untracked_all = _z(gitutil.run(repo, "ls-files", "-z", "--others", "--exclude-standard").stdout)
-    untracked = [p for p in untracked_all if not _is_secret(p) and not p.startswith(".kiln/")]
+    untracked = [
+        p for p in untracked_all if not _is_secret(p) and not _is_cache(p) and not p.startswith(".kiln/")
+    ]
     excluded = sorted(p for p in untracked_all if _is_secret(p))
 
     for rel in tracked:
@@ -159,6 +168,7 @@ def capture(project: Project, label: str) -> str:
         "files": len(manifest),
         "untracked": len(untracked),
         "excluded_secrets": excluded,
+        "excluded_caches": sum(_is_cache(p) for p in untracked_all),
         "lockfiles": lockfiles,
         "runtime": {"python": sys.version.split()[0], "platform": platform.platform()},
         "artifacts": {name: sha256(data) for name, data in artifacts.items()},

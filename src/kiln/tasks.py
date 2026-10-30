@@ -62,7 +62,9 @@ def split_session_patch(final: bytes) -> tuple[bytes, bytes]:
     return patches.join(fix), patches.join(tests)
 
 
-def create(project: Project, session_id: str, instruction: str, *, task_id: str | None = None) -> Path:
+def create(
+    project: Project, session_id: str, instruction: str, *, task_id: str | None = None, family: str = ""
+) -> Path:
     with project.db() as db:
         row = db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
     if row is None:
@@ -105,6 +107,7 @@ def create(project: Project, session_id: str, instruction: str, *, task_id: str 
         "schema": SCHEMA,
         "id": task_id,
         "version": version,
+        "family": family or task_id,
         "created": dt.datetime.now(dt.UTC).isoformat(),
         "repository": {"head": start_meta["head"], "branch": start_meta["branch"]},
         "start": {"snapshot": start_meta["id"], "state_hash": start_meta["state_hash"]},

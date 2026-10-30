@@ -43,16 +43,17 @@ test replacing pytest's reporting. Printed output is never parsed.
 
 **Validation.** `kiln task validate` runs the starting state twice and the reference
 fix three times (to find flaky tests), derives target and regression tests, then
-grades the reference fix, an empty patch and seven attack patches:
+grades the reference fix, an empty patch and eight attack patches:
 
 | Attack | What it tries |
 |---|---|
 | forged-conftest | root `conftest.py` that marks every test passed |
 | rewritten-target-tests | replaces the hidden tests with empty ones of the same name |
 | deleted-tests | deletes the test files |
-| sitecustomize | interpreter start-up hook |
+| shadowed-pytest | a `pytest.py` in the workspace that fakes the run and the report |
 | plugin-via-config | `pytest.ini` loading a plugin shipped in the patch |
 | in-process-report-patch | code under test rewrites pytest's verdicts at import time |
+| escape-sandbox | code under test writes outside its workspace and opens a network connection |
 | exit-before-report | code under test exits with status 0 before results are written |
 
 A task is `valid` only if the reference scores 1, the empty patch scores 0 and
@@ -62,9 +63,8 @@ are ungraded, never counted against the agent.
 
 ## Status
 
-Phases 1–2 of the build plan: capture, session import (Claude Code), task creation,
-verification and validation. Next: the rollout runner, difficulty calibration and
-the RL training adapter.
+Implemented: capture, session recording and import (Claude Code), task creation,
+verification and validation.
 
-Known limits: graded code runs on the host (containers come with the rollout
-runner); Python and pytest only; one agent log format.
+Known limits: isolation uses `sandbox-exec` on macOS and `bwrap` on Linux rather than
+containers; Python and pytest only; one agent log format so far.
