@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Turn your coding-agent sessions into verified, replayable RL tasks."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = []
 
 [project.scripts]
