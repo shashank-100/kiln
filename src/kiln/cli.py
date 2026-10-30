@@ -80,7 +80,7 @@ def cmd_record(a) -> int:
 
 def cmd_import(a) -> int:
     p = _p()
-    sid = record.import_trace(p, Path(a.path), a.start)
+    sid = record.import_trace(p, Path(a.path), a.start, Path(a.session_root) if a.session_root else None)
     _show_session(p, sid)
     recon = p.dir / "sessions" / sid / "reconstruction.json"
     if recon.exists():
@@ -88,6 +88,8 @@ def cmd_import(a) -> int:
         print(f"rebuild   {r['status']}  (start commit {r['start_commit'][:10] or '-'})")
         for reason in r["reasons"]:
             print(f"  - {reason}")
+        for n in r.get("notes", []):
+            print(f"  · {n}")
         print(f"  note: {r['limitation']}")
     return 0
 
@@ -298,7 +300,8 @@ def main(argv: list[str] | None = None) -> int:
     ts = s.add_subparsers(dest="sub", required=True)
     t = ts.add_parser("import", help="import a Claude Code session log")
     t.add_argument("path")
-    t.add_argument("--start", help="starting commit (default: last commit before the session began)")
+    t.add_argument("--start", help="starting commit (default: last commit before the session's first edit here)")
+    t.add_argument("--session-root", help="where this repository lived when the session ran, if it has moved")
     t.set_defaults(fn=cmd_import)
 
     sub.add_parser("sessions", help="list sessions").set_defaults(fn=cmd_sessions)

@@ -117,6 +117,7 @@ def parse_claude_code(path: Path) -> Parsed:
         if isinstance(result, dict) and "filePath" in result and ("oldString" in result or "content" in result):
             call_id = next((b.get("tool_use_id", "") for b in content or [] if isinstance(b, dict)), "")
             edits.append({
+                "ts": rec.get("timestamp", ""),
                 "call_id": call_id,
                 "tool": calls.get(call_id, ""),
                 "file": result["filePath"],

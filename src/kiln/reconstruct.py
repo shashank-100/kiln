@@ -14,6 +14,7 @@ edited cannot be seen in the log at all, which is reported as a limitation.
 
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 from dataclasses import asdict, dataclass, field
@@ -28,6 +29,23 @@ _MUTATING = re.compile(
     r"|\bsed\s+-i|\bperl\s+-[a-z]*i|\btee\b|\bmv\b|\bcp\b|\brm\b|\btouch\b|\bpatch\b"
     r"|\bgit\s+(?:apply|checkout|restore|reset|stash|pull|merge|rebase|cherry-pick|am)\b"
 )
+_QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+_REDIRECT = re.compile(r"(?<![0-9&<])>>?\s*([^\s;&|)]+)")
+
+
+def _may_mutate(cmd: str, root: Path) -> bool:
+    """Heuristic: could this shell command change files in the repository?"""
+    bare = _QUOTED.sub("''", cmd)  # quoted text is data (grep patterns, awk programs), not commands
+    for target in _REDIRECT.findall(bare):
+        t = os.path.expanduser(target)
+        if t.startswith("/dev/"):
+            continue
+        if not os.path.isabs(t) or Path(t) == root or root in Path(t).parents:
+            return True
+    without_redirects = _REDIRECT.sub(" ", bare)
+    return bool(_MUTATING.search(without_redirects.replace(">", " ")))
+
+
 _COMMIT_OUT = re.compile(r"^\[[^\]\s]+(?: \([^)]*\))? ([0-9a-f]{7,40})\]", re.MULTILINE)
 LIMITATION = (
     "Uncommitted changes to files the session did not edit cannot be detected from the log; "
@@ -42,6 +60,7 @@ class Reconstruction:
     start_snapshot: str = ""
     files: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     linked_commits: list[str] = field(default_factory=list)
     limitation: str = LIMITATION
     patch: bytes = b""
@@ -58,36 +77,58 @@ def _show(repo: Path, commit: str, rel: str) -> str | None:
     return r.stdout.decode("utf-8", "surrogateescape") if r.returncode == 0 else None
 
 
-def reconstruct(project: Project, parsed: sessions.Parsed, start_commit: str | None = None) -> Reconstruction:
-    root = project.root.resolve()
-    cwd = Path(parsed.cwd).resolve() if parsed.cwd else None
-    if cwd is None or not (cwd == root or root in cwd.parents):
-        return Reconstruction("rejected", reasons=[f"the session ran in {parsed.cwd}, outside {root}"])
-    if not parsed.edits:
-        return Reconstruction("rejected", reasons=["the session made no file edits with its edit tools"])
+def reconstruct(
+    project: Project,
+    parsed: sessions.Parsed,
+    start_commit: str | None = None,
+    session_root: Path | None = None,
+) -> Reconstruction:
+    """`session_root` is where this repository lived when the session ran (default: here)."""
+    root = Path(os.path.abspath(session_root or project.root))
+    real_root = root.resolve()
 
+    def inside(p: str) -> bool:
+        a = Path(os.path.abspath(p))
+        return root in a.parents or real_root in Path(a).resolve().parents
+
+    ours = [e for e in parsed.edits if inside(e["file"])]
+    if not ours:
+        where = "anywhere" if not parsed.edits else f"inside {root}"
+        return Reconstruction("rejected", reasons=[f"the session made no edits {where} with its edit tools"])
+    notes = []
+    others = sorted({e["file"] for e in parsed.edits if not inside(e["file"])})
+    if others:
+        notes.append(f"{len(others)} file(s) edited outside this repository were set aside")
+    cwd = Path(parsed.cwd) if parsed.cwd else None
+    if cwd is None or not (cwd == root or root in cwd.parents):
+        notes.append(f"the session started in {parsed.cwd}, not in the repository")
+
+    first_edit_ts = next((e["ts"] for e in ours if e.get("ts")), parsed.first_ts)
     if start_commit is None:
-        start_commit = gitutil.out(project.root, "rev-list", "-1", f"--before={parsed.first_ts}", "HEAD")
+        start_commit = gitutil.out(project.root, "rev-list", "-1", f"--before={first_edit_ts}", "HEAD")
         if not start_commit:
-            return Reconstruction("rejected", reasons=[f"no commit exists before the session began ({parsed.first_ts})"])
+            return Reconstruction("rejected", reasons=[f"no commit exists before the session's first edit ({first_edit_ts})"])
+        notes.append(f"starting commit: last commit before the first edit in this repository ({first_edit_ts})")
     start_commit = gitutil.out(project.root, "rev-parse", "--verify", f"{start_commit}^{{commit}}")
-    rec = Reconstruction("reconstructed", start_commit=start_commit)
+    rec = Reconstruction("reconstructed", start_commit=start_commit, notes=notes)
 
     contents: dict[str, str | None] = {}
     seen: set[str] = set()
-    for e in parsed.edits:
-        path = Path(e["file"]).resolve()
-        if root not in path.parents:
-            rec.reasons.append(f"edit outside the repository ignored: {e['file']}")
-            continue
-        rel = path.relative_to(root).as_posix()
+    unrecorded = 0
+    for e in ours:
+        a = Path(os.path.abspath(e["file"]))
+        rel = (a.relative_to(root) if root in a.parents else a.resolve().relative_to(real_root)).as_posix()
         if rel not in contents:
             contents[rel] = _show(project.root, start_commit, rel)
         current = contents[rel]
         before = e["original"]
         if e["kind"] == "create" and not before:
             before = None
-        if before != current:
+        if before is None and e["kind"] == "edit":
+            # The log omitted the file's content before this edit. Missing evidence is not
+            # contradicting evidence: rely on the edit's own text matching the replay instead.
+            unrecorded += 1
+        elif before != current:
             if rel not in seen:
                 rec.reasons.append(f"{rel} differed from the starting commit when the session first edited it "
                                    "(uncommitted or earlier changes)")  # fmt: skip
@@ -101,16 +142,25 @@ def reconstruct(project: Project, parsed: sessions.Parsed, start_commit: str | N
             current = e["content"] or ""
         else:
             if current is None or e["old"] not in current:
-                rec.reasons.append(f"an edit to {rel} does not apply to the content the log recorded")
+                rec.reasons.append(f"an edit to {rel} does not apply to the replayed content")
+                continue
+            if not e["replace_all"] and current.count(e["old"]) != 1:
+                rec.reasons.append(f"an edit to {rel} matches {current.count(e['old'])} places in the replayed content")
                 continue
             current = current.replace(e["old"], e["new"]) if e["replace_all"] else current.replace(e["old"], e["new"], 1)
         contents[rel] = current
     rec.files = sorted(contents)
+    if unrecorded:
+        rec.notes.append(f"the log omitted before-content for {unrecorded} edit(s); those were checked by "
+                         "matching each edit's text against the replay instead")  # fmt: skip
 
+    repo_markers = {str(root), str(real_root), root.name}
     for e in parsed.events:
         if e.kind == "tool_call" and e.tool == "Bash":
             cmd = str(e.args.get("command", ""))
-            if _MUTATING.search(cmd):
+            # In a multi-project session, only commands that may touch this repository matter.
+            relevant = any(m in cmd for m in repo_markers) or (cwd is not None and (cwd == root or root in cwd.parents))
+            if relevant and _may_mutate(cmd, root):
                 rec.reasons.append(f"shell command may have changed files outside the edit tools: {cmd[:120]}")
         if e.kind == "tool_result" and e.tool == "Bash":
             rec.linked_commits += _COMMIT_OUT.findall(e.text)

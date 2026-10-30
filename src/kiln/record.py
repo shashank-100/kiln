@@ -88,7 +88,9 @@ def record(project: Project, command: list[str], *, agent: str = "claude-code") 
     return sid
 
 
-def import_trace(project: Project, path: Path, start_commit: str | None = None) -> str:
+def import_trace(
+    project: Project, path: Path, start_commit: str | None = None, session_root: Path | None = None
+) -> str:
     """Import an existing log; rebuild its starting state and patch when the log allows it."""
     import json
 
@@ -99,7 +101,7 @@ def import_trace(project: Project, path: Path, start_commit: str | None = None) 
     parsed = sessions.parse_claude_code(path)
     sessions.write(parsed, out / "log")
     shutil.copy2(path, out / "raw0.jsonl")
-    rec = reconstruct.reconstruct(project, parsed, start_commit)
+    rec = reconstruct.reconstruct(project, parsed, start_commit, session_root)
     (out / "reconstruction.json").write_text(json.dumps(rec.summary(), indent=2), encoding="utf-8")
     final = None
     if rec.status in ("reconstructed", "needs_review"):
