@@ -88,16 +88,29 @@ def record(project: Project, command: list[str], *, agent: str = "claude-code") 
     return sid
 
 
-def import_trace(project: Project, path: Path) -> str:
-    """Import an existing log. Without a captured starting state it can't become a task yet."""
+def import_trace(project: Project, path: Path, start_commit: str | None = None) -> str:
+    """Import an existing log; rebuild its starting state and patch when the log allows it."""
+    import json
+
+    from kiln import reconstruct
+
     sid = _session_id()
-    n_events, completeness = _import_logs(project, sid, [path])
     out = project.dir / "sessions" / sid
+    parsed = sessions.parse_claude_code(path)
+    sessions.write(parsed, out / "log")
     shutil.copy2(path, out / "raw0.jsonl")
+    rec = reconstruct.reconstruct(project, parsed, start_commit)
+    (out / "reconstruction.json").write_text(json.dumps(rec.summary(), indent=2), encoding="utf-8")
+    final = None
+    if rec.status in ("reconstructed", "needs_review"):
+        final = out / "final.patch"
+        final.write_bytes(rec.patch)
     with project.db() as db:
         db.execute(
-            "INSERT INTO sessions (id, agent, source, status, events, completeness) "
-            "VALUES (?, 'claude-code', ?, 'imported', ?, ?)",
-            (sid, str(path), n_events, f"{completeness}; no starting snapshot"),
-        )
+            "INSERT INTO sessions (id, agent, source, started, ended, status, start_snapshot, final_patch, "
+            "events, completeness) VALUES (?, 'claude-code', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (sid, str(path), parsed.first_ts, parsed.last_ts, f"imported:{rec.status}",
+             rec.start_snapshot or None, str(final) if final else None, len(parsed.events),
+             parsed.completeness),
+        )  # fmt: skip
     return sid

@@ -14,7 +14,8 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-PARSER = "claude-code/1"
+PARSER = "claude-code/2"
+EVENT_FORMAT = "kiln.events/1"
 MAX_INLINE = 32 * 1024
 
 _SECRETS = [
@@ -48,6 +49,7 @@ class Event:
     args: dict = field(default_factory=dict)
     is_error: bool = False
     output_ref: str = ""  # sha256 of the full output when it was too large to inline
+    truncated: bool = False  # the inline text is cut; the full output is in the blob
     sidechain: bool = False
     source: str = ""  # file:line it came from
 
@@ -62,6 +64,7 @@ class Parsed:
     dangling_calls: list[str]
     first_ts: str
     last_ts: str
+    edits: list[dict] = field(default_factory=list)  # file edits with before/after content, in order
 
     @property
     def completeness(self) -> str:
@@ -84,6 +87,7 @@ def parse_claude_code(path: Path) -> Parsed:
     seen: set[str] = set()
     calls: dict[str, str] = {}
     malformed = 0
+    edits: list[dict] = []
     session_id = cwd = first_ts = last_ts = ""
 
     def add(**kw) -> None:
@@ -109,6 +113,21 @@ def parse_claude_code(path: Path) -> Parsed:
         last_ts = ts or last_ts
         msg = rec.get("message") or {}
         content = msg.get("content")
+        result = rec.get("toolUseResult")
+        if isinstance(result, dict) and "filePath" in result and ("oldString" in result or "content" in result):
+            call_id = next((b.get("tool_use_id", "") for b in content or [] if isinstance(b, dict)), "")
+            edits.append({
+                "call_id": call_id,
+                "tool": calls.get(call_id, ""),
+                "file": result["filePath"],
+                "kind": result.get("type") or "edit",
+                "original": result.get("originalFile"),
+                "old": result.get("oldString"),
+                "new": result.get("newString"),
+                "replace_all": bool(result.get("replaceAll")),
+                "content": result.get("content"),
+                "user_modified": bool(result.get("userModified")),
+            })  # fmt: skip
         base = dict(ts=ts, sidechain=bool(rec.get("isSidechain")), source=f"{path.name}:{lineno}")
         uid = rec.get("uuid", f"line{lineno}")
         if isinstance(content, str):
@@ -134,9 +153,9 @@ def parse_claude_code(path: Path) -> Parsed:
                 call_id = block.get("tool_use_id", "")
                 add(id=bid, kind="tool_result", role="tool", tool=calls.pop(call_id, ""),
                     call_id=call_id, text=output, is_error=bool(block.get("is_error")),
-                    output_ref=ref, **base)  # fmt: skip
+                    output_ref=ref, truncated=bool(ref), **base)  # fmt: skip
             # thinking / redacted_thinking: not observable, deliberately skipped
-    return Parsed(session_id, cwd, events, blobs, malformed, sorted(calls), first_ts, last_ts)
+    return Parsed(session_id, cwd, events, blobs, malformed, sorted(calls), first_ts, last_ts, edits)
 
 
 def write(parsed: Parsed, out_dir: Path) -> Path:
@@ -145,6 +164,9 @@ def write(parsed: Parsed, out_dir: Path) -> Path:
     with events_path.open("w", encoding="utf-8") as f:
         for e in parsed.events:
             f.write(json.dumps(asdict(e), ensure_ascii=False) + "\n")
+    with (out_dir / "edits.jsonl").open("w", encoding="utf-8") as f:
+        for e in parsed.edits:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
     for digest, body in parsed.blobs.items():
         blob = out_dir / "blobs" / f"{digest}.txt"
         blob.parent.mkdir(exist_ok=True)
@@ -153,6 +175,8 @@ def write(parsed: Parsed, out_dir: Path) -> Path:
         json.dumps(
             {
                 "parser": PARSER,
+                "event_format": EVENT_FORMAT,
+                "edits": len(parsed.edits),
                 "session_id": parsed.session_id,
                 "cwd": parsed.cwd,
                 "events": len(parsed.events),

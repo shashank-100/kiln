@@ -18,6 +18,7 @@ from kiln import patches, sessions
 from kiln.project import Project, dump
 
 SCHEMA = 1
+DEMO_FORMAT = "kiln.demo/1"
 
 
 class TaskError(RuntimeError):
@@ -63,14 +64,25 @@ def split_session_patch(final: bytes) -> tuple[bytes, bytes]:
 
 
 def create(
-    project: Project, session_id: str, instruction: str, *, task_id: str | None = None, family: str = ""
+    project: Project,
+    session_id: str,
+    instruction: str,
+    *,
+    task_id: str | None = None,
+    family: str = "",
+    accept_review: bool = False,
 ) -> Path:
     with project.db() as db:
         row = db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
     if row is None:
         raise TaskError(f"unknown session {session_id}")
     if not row["start_snapshot"] or not row["final_patch"]:
-        raise TaskError("this session has no captured starting state; record it with `kiln record`")
+        raise TaskError("this session has no usable starting state and patch (see `kiln session show`)")
+    if row["status"] == "imported:needs_review" and not accept_review:
+        raise TaskError(
+            "this imported session needs review before it can become a task; read "
+            f".kiln/sessions/{session_id}/reconstruction.json, then rerun with --accept-review"
+        )
     if not instruction.strip():
         raise TaskError("the instruction is empty")
 
@@ -100,6 +112,7 @@ def create(
     (task_dir / "private" / "reference.patch").write_bytes(fix)
     (task_dir / "private" / "test.patch").write_bytes(tests)
     (task_dir / "instruction.md").write_text(instruction.strip() + "\n", encoding="utf-8")
+    demo = write_demonstration(project, session_id, final, task_dir / "private" / "demonstration")
 
     cfg = project.config()
     start_meta = json.loads((task_dir / "start" / "meta.json").read_text(encoding="utf-8"))
@@ -123,12 +136,17 @@ def create(
             "test_files": sorted({f.path for f in patches.split(tests)}),
         },
         "reference": {"files": sorted({f.path for f in patches.split(fix)})},
+        "demonstration": {k: demo[k] for k in ("format", "available", "events", "completeness",
+                                                "truncated_results", "changed_outside_edit_tools") if k in demo},
         "provenance": {
             "method": "recorded-session",
             "session": session_id,
             "agent": row["agent"],
             "parser": sessions.PARSER,
-            "review": "instruction reviewed at creation",
+            "review": "instruction reviewed at creation"
+            + ("; reconstruction accepted after review" if accept_review else ""),
+            "start_state": "captured live" if not str(row["status"]).startswith("imported")
+            else "rebuilt from a commit and the session's own edits",
         },
     }
     (task_dir / "manifest.json").write_text(dump(manifest), encoding="utf-8")
@@ -138,6 +156,62 @@ def create(
             (task_id, version, session_id, manifest["created"], str(task_dir), content_hash(task_dir)),
         )
     return task_dir
+
+
+def _messages(events: list[dict]) -> list[dict]:
+    """Chat-format view of the trace: one message per event, ids and order preserved."""
+    out = []
+    for e in events:
+        if e["kind"] == "message":
+            out.append({"role": e["role"], "content": e["text"], "event": e["id"]})
+        elif e["kind"] == "tool_call":
+            out.append({"role": "assistant", "content": "", "event": e["id"],
+                        "tool_calls": [{"id": e["call_id"], "name": e["tool"], "arguments": e["args"]}]})
+        else:
+            out.append({"role": "tool", "tool_call_id": e["call_id"], "name": e["tool"], "content": e["text"],
+                        "is_error": e["is_error"], "truncated": e.get("truncated", False), "event": e["id"]})
+    return out  # fmt: skip
+
+
+def write_demonstration(project: Project, session_id: str, final_patch: bytes, out: Path) -> dict:
+    """Bundle the session's own trace with the task, outside anything an agent sees."""
+    log = project.dir / "sessions" / session_id / "log"
+    if not (log / "events.jsonl").exists():
+        return {"format": DEMO_FORMAT, "available": False, "reason": "no agent log was linked to this session"}
+    out.mkdir(parents=True)
+    events = list(sessions.read_events(log))
+    edits_path = log / "edits.jsonl"
+    edits = [json.loads(l) for l in edits_path.read_text(encoding="utf-8").splitlines()] if edits_path.exists() else []
+    shutil.copy(log / "events.jsonl", out / "events.jsonl")
+    if edits_path.exists():
+        shutil.copy(edits_path, out / "edits.jsonl")
+    if (log / "blobs").exists():
+        shutil.copytree(log / "blobs", out / "blobs")
+    (out / "messages.json").write_text(json.dumps(_messages(events), indent=1, ensure_ascii=False), encoding="utf-8")
+
+    root = project.root.resolve()
+    edited = set()
+    for e in edits:
+        p = Path(e["file"]).resolve()
+        if root in p.parents:
+            edited.add(p.relative_to(root).as_posix())
+    changed = {f.path for f in patches.split(final_patch)}
+    session_meta = json.loads((log / "session.json").read_text(encoding="utf-8"))
+    meta = {
+        "format": DEMO_FORMAT,
+        "available": True,
+        "event_format": session_meta.get("event_format", ""),
+        "parser": session_meta.get("parser", ""),
+        "agent_session_id": session_meta.get("session_id", ""),
+        "events": len(events),
+        "completeness": session_meta.get("completeness", ""),
+        "truncated_results": sum(1 for e in events if e.get("truncated")),
+        "sidechain_events": sum(1 for e in events if e.get("sidechain")),
+        "changed_outside_edit_tools": sorted(changed - edited),
+        "note": "Hidden reasoning is not part of the log and is not included.",
+    }
+    (out / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return meta
 
 
 def resolve(project: Project | None, ref: str) -> Path:

@@ -182,6 +182,65 @@ def capture(project: Project, label: str) -> str:
     return snap_id
 
 
+def capture_commit(project: Project, commit: str, label: str) -> str:
+    """Snapshot a commit exactly as committed (for sessions that weren't recorded live)."""
+    import tempfile
+
+    repo = project.root
+    sha = gitutil.out(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+    if (repo / ".gitmodules").exists():
+        raise CaptureError("submodules are not supported yet")
+    base = gitutil.run(repo, "archive", "--format=tar", sha).stdout
+    with tempfile.TemporaryDirectory(prefix="kiln-commit-") as tmp:
+        with tarfile.open(fileobj=io.BytesIO(base)) as tar:
+            tar.extractall(tmp, filter="tar")
+        manifest = walk_state(Path(tmp))
+    s_hash = state_hash(manifest)
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%f")
+    snap_id = f"snap-{stamp}-{s_hash[:8]}"
+    out = project.path("snapshots", snap_id, "x").parent
+    empty_tar = io.BytesIO()
+    with tarfile.open(fileobj=empty_tar, mode="w"):
+        pass
+    artifacts = {
+        "base.tar": base,
+        "staged.patch": b"",
+        "unstaged.patch": b"",
+        "untracked.tar": empty_tar.getvalue(),
+        "manifest.json": dump(manifest).encode(),
+    }
+    for name, data in artifacts.items():
+        (out / name).write_bytes(data)
+    meta = {
+        "id": snap_id,
+        "label": label,
+        "created": dt.datetime.now(dt.UTC).isoformat(),
+        "repo": str(repo),
+        "head": sha,
+        "branch": None,
+        "state_hash": s_hash,
+        "files": len(manifest),
+        "untracked": 0,
+        "excluded_secrets": [],
+        "excluded_caches": 0,
+        "source": "commit",
+        "lockfiles": {
+            rel: e["sha256"]
+            for rel, e in manifest.items()
+            if "sha256" in e and any(fnmatch.fnmatch(rel.rsplit("/", 1)[-1], g) for g in LOCKFILES)
+        },
+        "runtime": {"python": sys.version.split()[0], "platform": platform.platform()},
+        "artifacts": {name: sha256(data) for name, data in artifacts.items()},
+    }
+    (out / "meta.json").write_text(dump(meta), encoding="utf-8")
+    with project.db() as db:
+        db.execute(
+            "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?)",
+            (snap_id, meta["created"], sha, None, s_hash, str(out)),
+        )
+    return snap_id
+
+
 def load_meta(snap_dir: Path) -> dict:
     meta = json.loads((snap_dir / "meta.json").read_text(encoding="utf-8"))
     for name, digest in meta["artifacts"].items():

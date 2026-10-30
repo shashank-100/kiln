@@ -80,8 +80,15 @@ def cmd_record(a) -> int:
 
 def cmd_import(a) -> int:
     p = _p()
-    sid = record.import_trace(p, Path(a.path))
+    sid = record.import_trace(p, Path(a.path), a.start)
     _show_session(p, sid)
+    recon = p.dir / "sessions" / sid / "reconstruction.json"
+    if recon.exists():
+        r = json.loads(recon.read_text())
+        print(f"rebuild   {r['status']}  (start commit {r['start_commit'][:10] or '-'})")
+        for reason in r["reasons"]:
+            print(f"  - {reason}")
+        print(f"  note: {r['limitation']}")
     return 0
 
 
@@ -119,7 +126,8 @@ def cmd_task_create(a) -> int:
         print(f"  kiln task create --session {a.session} --instruction-file <file>")
         return 2
     try:
-        d = tasks.create(p, a.session, instruction, task_id=a.id, family=a.family or "")
+        d = tasks.create(p, a.session, instruction, task_id=a.id, family=a.family or "",
+                         accept_review=a.accept_review)  # fmt: skip
     except tasks.TaskError as e:
         print(f"cannot create task: {e}", file=sys.stderr)
         return 1
@@ -217,6 +225,60 @@ def cmd_gc(a) -> int:
     return 0
 
 
+def cmd_env_reset(a) -> int:
+    from kiln.env import Env, EnvError
+
+    e = Env(_task_dir(a.task))
+    try:
+        ws = e.reset(a.dir)
+    except EnvError as err:
+        print(json.dumps({"status": "ungraded", "reason": "reset_failed", "detail": str(err)}))
+        return 2
+    print(json.dumps({"task": e.id, "workspace": str(ws), "instruction": e.instruction.strip()}, indent=2))
+    return 0
+
+
+def cmd_env_grade(a) -> int:
+    from kiln.env import Env
+
+    r = Env(_task_dir(a.task)).grade(workspace=a.dir)
+    d = r.to_dict()
+    if not a.verbose:
+        d["diagnostics"].pop("log_tail", None)
+    print(json.dumps(d, indent=2))
+    return 0 if r.status != "ungraded" else 2
+
+
+def cmd_attempt(a) -> int:
+    from kiln import env as kenv
+
+    if not a.command:
+        print("usage: kiln attempt <task> -- <agent command>", file=sys.stderr)
+        return 2
+    task_dir = _task_dir(a.task).resolve()
+    hidden = [Path(h) for h in a.hide]
+    try:
+        p = _p()
+        hidden += [p.root, kenv._claude_logs_for(p.root.resolve())]
+        out = p.dir / "attempts" / task_dir.parent.name
+    except SystemExit:
+        out = Path(a.out) if a.out else Path.cwd() / "kiln-attempts"
+    if a.out:
+        out = Path(a.out)
+    rec = kenv.attempt(task_dir, a.command, hidden=hidden, timeout=a.timeout, out_dir=out)
+    r = rec["result"]
+    print(f"attempt {rec['id']}  task {rec['task']}  {rec.get('termination', '')}  {rec.get('seconds', '')}s")
+    print(f"result  {r['status']}  reward={r['reward']}  {r['reason']}")
+    diag = r.get("diagnostics", {})
+    if diag.get("targets"):
+        for t in diag["targets"]:
+            print(f"  target {diag['tests'].get(t, 'not run'):<8} {t}")
+    if diag.get("dropped_files"):
+        print(f"  dropped (tests/config edits): {', '.join(diag['dropped_files'])}")
+    print(f"record  {out / (rec['id'] + '.json')}")
+    return 0 if r["status"] != "ungraded" else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="kiln", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -229,13 +291,14 @@ def main(argv: list[str] | None = None) -> int:
     s.set_defaults(fn=cmd_snapshot)
 
     s = sub.add_parser("record", help="record an agent session: kiln record -- <command>")
-    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.add_argument("command", nargs="*", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_record)
 
     s = sub.add_parser("traces", help="work with existing agent logs")
     ts = s.add_subparsers(dest="sub", required=True)
     t = ts.add_parser("import", help="import a Claude Code session log")
     t.add_argument("path")
+    t.add_argument("--start", help="starting commit (default: last commit before the session began)")
     t.set_defaults(fn=cmd_import)
 
     sub.add_parser("sessions", help="list sessions").set_defaults(fn=cmd_sessions)
@@ -257,6 +320,8 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--instruction-file")
     t.add_argument("--id")
     t.add_argument("--family", help="bug family, used to keep related tasks in one split")
+    t.add_argument("--accept-review", action="store_true",
+                   help="use an imported session whose rebuild needs review (after checking it)")
     t.set_defaults(fn=cmd_task_create)
     t = ts.add_parser("validate", help="run the controls and the attack suite")
     t.add_argument("task", help="task id, id@version, or a task directory")
@@ -277,9 +342,35 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(fn=cmd_grade)
 
+    s = sub.add_parser("env", help="use a task as an environment: reset a workspace, grade it")
+    ts = s.add_subparsers(dest="sub", required=True)
+    t = ts.add_parser("reset", help="create a fresh workspace from the task's starting state")
+    t.add_argument("task")
+    t.add_argument("dir", nargs="?", help="where to create it (default: a temp dir)")
+    t.set_defaults(fn=cmd_env_reset)
+    t = ts.add_parser("grade", help="grade the current contents of a workspace")
+    t.add_argument("task")
+    t.add_argument("dir")
+    t.add_argument("-v", "--verbose", action="store_true")
+    t.set_defaults(fn=cmd_env_grade)
+
+    s = sub.add_parser("attempt", help="reset, run an agent in the workspace, grade: kiln attempt <task> -- <cmd>")
+    s.add_argument("task")
+    s.add_argument("--timeout", type=int, default=900)
+    s.add_argument("--hide", action="append", default=[], help="extra path the agent must not read")
+    s.add_argument("--out", help="where to write the attempt record")
+    s.add_argument("command", nargs="*", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_attempt)
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Everything after the first `--` is the agent's command, never kiln's options.
+    after: list[str] | None = None
+    if "--" in argv and argv[:1] and argv[0] in ("record", "attempt"):
+        i = argv.index("--")
+        argv, after = argv[:i], argv[i + 1 :]
     a = ap.parse_args(argv)
-    if a.cmd == "record" and a.command[:1] == ["--"]:
-        a.command = a.command[1:]
+    if after is not None:
+        a.command = after
     return a.fn(a)
 
 

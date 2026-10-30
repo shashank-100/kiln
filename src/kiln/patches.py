@@ -102,9 +102,17 @@ def is_test_path(path: str) -> bool:
     )
 
 
+_CACHE_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv"}
+
+
 def is_control_path(path: str) -> bool:
-    name = path.split("/")[-1]
-    return any(fnmatch.fnmatch(name, p) for p in CONTROL_FILES) or path.startswith(".venv/")
+    parts = path.split("/")
+    name = parts[-1]
+    return (
+        any(fnmatch.fnmatch(name, p) for p in CONTROL_FILES)
+        or any(p in _CACHE_DIRS for p in parts[:-1])
+        or fnmatch.fnmatch(name, "*.py[co]")
+    )
 
 
 def added_lines(patch: bytes) -> list[str]:
